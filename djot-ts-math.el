@@ -29,6 +29,17 @@ A backend NAME is registered with `djot-ts-math-define-backend', or
 by the library djot-ts-math-NAME, loaded on demand."
   :type 'symbol)
 
+(defcustom djot-ts-math-center-display t
+  "Non-nil means center the images of display math."
+  :type 'boolean)
+
+(defcustom djot-ts-math-display-own-line t
+  "Non-nil means show the images of display math on their own line.
+Applies to display math inside a paragraph: text before or after it on
+the same line is shown on the previous, resp. next line.  The buffer
+text is not changed."
+  :type 'boolean)
+
 (defvar djot-ts-math--backends nil
   "Alist of (NAME . PLIST), see `djot-ts-math-define-backend'.")
 
@@ -45,10 +56,14 @@ by the library djot-ts-math-NAME, loaded on demand."
 :reveal OV       Required.  Show the source under OV.  It must stay
                  shown if OV's image arrives later.
 :conceal OV      Required.  Show OV's image.
+:image OV        Optional.  Return OV's image spec, or nil if it has
+                 none yet.  Needed to center and break display math.
 :setup           Optional.  Called in the buffer when the mode is
 :teardown        enabled, resp. disabled.
 
-Previews are removed with `delete-overlay'."
+Previews are removed with `delete-overlay'.  A backend whose images
+arrive asynchronously should call `djot-ts-math-image-updated' on
+the overlay when they do."
   (dolist (k '(:place :overlay-p :reveal :conceal))
     (unless (functionp (plist-get plist k))
       (error "Backend %s: %s must be a function" name k)))
@@ -67,6 +82,9 @@ Previews are removed with `delete-overlay'."
 
 (defvar-local djot-ts-math--revealed nil
   "Preview overlays whose source is shown.")
+
+(defvar-local djot-ts-math--layouts nil
+  "Layout overlays, see `djot-ts-math--layout'.")
 
 (defvar djot-ts-math--query nil
   "Compiled query for math nodes.")
@@ -111,6 +129,79 @@ Previews are removed with `delete-overlay'."
   (seq-find (lambda (o) (and (= beg (overlay-start o)) (= end (overlay-end o))))
             (djot-ts-math--overlays beg end)))
 
+(defun djot-ts-math--in-paragraph-p (pos)
+  "Non-nil if the math starting at POS is inside a paragraph."
+  (when-let* ((leaf (treesit-node-at pos djot-ts-math--parser))
+              (math (treesit-parent-until
+                     leaf (lambda (n) (equal (treesit-node-type n) "math")) t)))
+    (treesit-parent-until
+     math (lambda (n) (equal (treesit-node-type n) "paragraph")))))
+
+(defun djot-ts-math--layout-strings (ov)
+  "Return (BEFORE . AFTER) strings laying out the preview OV, or nil.
+Only display math with an image is laid out."
+  (when-let* (((nth 1 (overlay-get ov 'djot-ts-math-source)))
+              (img (djot-ts-math--call :image ov)))
+    (let* ((beg (overlay-start ov))
+           (end (overlay-end ov))
+           (inline (djot-ts-math--in-paragraph-p beg))
+           (alone-before (or (not inline)
+                             (save-excursion (goto-char beg)
+                                             (skip-chars-backward " \t")
+                                             (bolp))))
+           (alone-after (or (not inline)
+                            (save-excursion (goto-char end)
+                                            (skip-chars-forward " \t")
+                                            (eolp))))
+           (break djot-ts-math-display-own-line)
+           (before (concat
+                    (and break (not alone-before) "\n")
+                    (and djot-ts-math-center-display (or break alone-before)
+                         (propertize
+                          " " 'face 'default
+                          'display `(space :align-to (- center (0.55 . ,img)))))))
+           (after (and break (not alone-after) "\n")))
+      (unless (and (string-empty-p before) (null after))
+        (cons (and (not (string-empty-p before)) before) after)))))
+
+(defun djot-ts-math--unlayout (ov)
+  "Remove the layout of the preview OV."
+  (when-let* ((l (overlay-get ov 'djot-ts-math-layout)))
+    (delete-overlay l)
+    (setq djot-ts-math--layouts (delq l djot-ts-math--layouts))
+    (overlay-put ov 'djot-ts-math-layout nil)))
+
+(defun djot-ts-math--layout (ov)
+  "Center display math OV and put it on its own line, per the options.
+This uses a separate overlay, so that the backend's overlay
+properties are left alone."
+  (djot-ts-math--unlayout ov)
+  (when-let* ((s (djot-ts-math--layout-strings ov))
+              (l (make-overlay (overlay-start ov) (overlay-end ov))))
+    (overlay-put l 'evaporate t)
+    (overlay-put l 'djot-ts-math-preview ov)
+    (overlay-put l 'before-string (car s))
+    (overlay-put l 'after-string (cdr s))
+    (overlay-put ov 'djot-ts-math-layout l)
+    (push l djot-ts-math--layouts)))
+
+(defun djot-ts-math--gc-layouts ()
+  "Delete the layouts of deleted previews."
+  (dolist (l djot-ts-math--layouts)
+    (unless (overlay-buffer (overlay-get l 'djot-ts-math-preview))
+      (delete-overlay l)
+      (setq djot-ts-math--layouts (delq l djot-ts-math--layouts)))))
+
+(defun djot-ts-math-image-updated (ov)
+  "Update the layout of the preview OV after its image changed.
+Backends call this when an image arrives, see
+`djot-ts-math-define-backend'."
+  (when-let* ((buf (overlay-buffer ov)))
+    (with-current-buffer buf
+      (when (and djot-ts-math-mode
+                 (not (memq ov djot-ts-math--revealed)))
+        (djot-ts-math--layout ov)))))
+
 (defun djot-ts-math--place (entries)
   "Preview ENTRIES, skipping those whose preview is up to date."
   (when-let* ((todo (seq-remove
@@ -121,7 +212,9 @@ Previews are removed with `delete-overlay'."
     (djot-ts-math--call :place todo)
     (dolist (e todo)
       (when-let* ((ov (djot-ts-math--overlay (nth 0 e) (nth 1 e))))
-        (overlay-put ov 'djot-ts-math-source (cddr e))))))
+        (overlay-put ov 'djot-ts-math-source (cddr e))
+        (unless (memq ov djot-ts-math--revealed)
+          (djot-ts-math--layout ov))))))
 
 (defun djot-ts-math--mark-dirty (beg end)
   "Add BEG..END to the region to re-render."
@@ -152,6 +245,7 @@ That fragment stays dirty."
       (unless (seq-find (lambda (f) (and (= (nth 0 f) (overlay-start ov))
                                          (= (nth 1 f) (overlay-end ov))))
                         frags)
+        (djot-ts-math--unlayout ov)
         (delete-overlay ov)))
     (djot-ts-math--place (remq here frags))
     (if here
@@ -167,9 +261,11 @@ That fragment stays dirty."
                          (overlays-at pt))))
     (dolist (o djot-ts-math--revealed)
       (when (and (overlay-buffer o) (not (memq o new)))
-        (djot-ts-math--call :conceal o)))
+        (djot-ts-math--call :conceal o)
+        (djot-ts-math--layout o)))
     (dolist (o new)
       (unless (memq o djot-ts-math--revealed)
+        (djot-ts-math--unlayout o)
         (djot-ts-math--call :reveal o)))
     (setq djot-ts-math--revealed new)))
 
@@ -178,6 +274,7 @@ That fragment stays dirty."
   (with-demoted-errors "djot-ts-math: %S"
     ;; Reparse now, so that the notifier runs before the refresh.
     (treesit-parser-root-node djot-ts-math--parser)
+    (djot-ts-math--gc-layouts)
     (when djot-ts-math--dirty
       (djot-ts-math--refresh (point)))
     (djot-ts-math--update-reveal (point))))
@@ -204,12 +301,14 @@ The images are made by `djot-ts-math-backend'."
     (remove-hook 'post-command-hook #'djot-ts-math--post-command t)
     (when (treesit-parser-p djot-ts-math--parser)
       (treesit-parser-remove-notifier djot-ts-math--parser #'djot-ts-math--notifier))
+    (mapc #'delete-overlay djot-ts-math--layouts)
     (when djot-ts-math--backend
       (mapc #'delete-overlay (djot-ts-math--overlays))
       (djot-ts-math--call :teardown))
     (setq djot-ts-math--backend nil
           djot-ts-math--parser nil
           djot-ts-math--dirty nil
+          djot-ts-math--layouts nil
           djot-ts-math--revealed nil)))
 
 (provide 'djot-ts-math)

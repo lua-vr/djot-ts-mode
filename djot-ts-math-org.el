@@ -62,12 +62,29 @@
     (overlay-put ov 'org-hidden-face nil))
   (overlay-put ov 'display (overlay-get ov 'org-preview-image)))
 
+(defun djot-ts-math-org--image (ov)
+  "Return the image spec of OV."
+  (overlay-get ov 'org-preview-image))
+
+(defun djot-ts-math-org--setup ()
+  "Report arriving images to `djot-ts-math'."
+  (add-hook 'org-latex-preview-overlay-update-functions
+            #'djot-ts-math-image-updated nil t))
+
+(defun djot-ts-math-org--teardown ()
+  "Undo `djot-ts-math-org--setup'."
+  (remove-hook 'org-latex-preview-overlay-update-functions
+               #'djot-ts-math-image-updated t))
+
 (djot-ts-math-define-backend
  'org
  :place #'djot-ts-math-org--place
  :overlay-p #'djot-ts-math-org--overlay-p
  :reveal #'djot-ts-math-org--reveal
- :conceal #'djot-ts-math-org--conceal)
+ :conceal #'djot-ts-math-org--conceal
+ :image #'djot-ts-math-org--image
+ :setup #'djot-ts-math-org--setup
+ :teardown #'djot-ts-math-org--teardown)
 
 (provide 'djot-ts-math-org)
 ;;; djot-ts-math-org.el ends here
