@@ -30,6 +30,15 @@
 (defface djot-ts-code-block-delimiter '((t :inherit org-block-begin-line))
   "Face for the opening and closing lines of code and raw blocks.")
 
+(defface djot-ts-heading-marker '((t :inherit shadow))
+  "Face for heading markers, on top of the heading's `outline-N' face.")
+
+(defcustom djot-ts-hide-leading-markers nil
+  "Non-nil means display all but the last `#' of heading markers as dots.
+Takes effect after refontification, e.g. with \\[font-lock-update]."
+  :type 'boolean
+  :group 'djot-ts)
+
 (defun djot-ts-mode--opener (node)
   "Return the child of block NODE where its own syntax begins.
 This skips the block attributes and block quote markers before it.
@@ -71,13 +80,27 @@ The fence lines get `djot-ts-code-block-delimiter', the rest
 
 (defun djot-ts-mode--fontify-heading (node override start end &rest _)
   "Fontify heading NODE with `outline-N' by its marker length.
+The marker also gets `djot-ts-heading-marker'.  If
+`djot-ts-hide-leading-markers' is non-nil, each `#' of the marker but
+the last is displayed as a middle dot with that face.
 OVERRIDE, START and END are as in `treesit-fontify-with-override'."
   (let* ((marker (treesit-node-child-by-field-name node "marker"))
-         (level (string-search " " (treesit-node-text marker t)))
-         (face (intern (format "outline-%d" (min (or level 1) 8)))))
+         (mbeg (treesit-node-start marker))
+         (level (or (string-search " " (treesit-node-text marker t)) 1))
+         (face (intern (format "outline-%d" (min level 8)))))
     (treesit-fontify-with-override
-     (treesit-node-start marker) (treesit-node-end node)
-     face override start end)))
+     mbeg (treesit-node-end node) face override start end)
+    (treesit-fontify-with-override
+     mbeg (treesit-node-end marker) 'djot-ts-heading-marker 'prepend start end)
+    (when djot-ts-hide-leading-markers
+      ;; One display string per character, so that each is a separate
+      ;; replacement (`eq' adjacent strings would merge into one).
+      (dotimes (i (1- level))
+        (let ((pos (+ mbeg i)))
+          (when (and (<= start pos) (< pos end))
+            (put-text-property
+             pos (1+ pos) 'display
+             (propertize " " 'face 'djot-ts-heading-marker))))))))
 
 (defvar djot-ts-mode--font-lock-settings
   (treesit-font-lock-rules
@@ -124,7 +147,7 @@ OVERRIDE, START and END are as in `treesit-fontify-with-override'."
    :language 'djot
    :feature 'delimiter
    :override t
-   '([(marker) (div_marker_begin) (div_marker_end)
+   '([(div_marker_begin) (div_marker_end)
       (code_block_marker_begin) (code_block_marker_end)
       (raw_block_marker_begin) (raw_block_marker_end)
       (frontmatter_marker) (block_quote_marker)
@@ -352,6 +375,8 @@ blocks and block attributes, and outline elsewhere."
                 comment-end " %}"
                 comment-start-skip "{%+[ \t]*"
                 comment-end-skip "[ \t]*%+}")
+    (setq-local font-lock-extra-managed-props
+                (cons 'display font-lock-extra-managed-props))
     (setq-local treesit-font-lock-settings djot-ts-mode--font-lock-settings
                 treesit-font-lock-feature-list
                 '((comment heading block)
