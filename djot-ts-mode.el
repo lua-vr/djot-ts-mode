@@ -2,7 +2,7 @@
 
 ;; Author: Lua <me@lua.blog.br>
 ;; Version: 0.1
-;; Package-Requires: ((emacs "31.1"))
+;; Package-Requires: ((emacs "31.1") (org "9.8pre"))
 ;; Keywords: text, languages
 
 ;;; Commentary:
