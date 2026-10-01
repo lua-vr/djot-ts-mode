@@ -254,7 +254,7 @@ A one-line block attribute is not, so its block folds instead."
 
 (defun djot-ts-mode--fold-end (node)
   "Return the position where the fold of NODE ends.
-For a block, this is before its closing marker.  For a block attribute,
+For a block, this is after its closing marker.  For a block attribute,
 this is before its closing brace.  For a nested heading, this is before
 the next sibling heading of the same or lower level."
   (if (equal (treesit-node-type node) "block_attribute")
@@ -270,7 +270,7 @@ the next sibling heading of the same or lower level."
                (treesit-node-end last))
            (let ((close (treesit-node-child node -1)))
              (if (string-suffix-p "_end" (treesit-node-type close))
-                 (treesit-node-start close)
+                 (treesit-node-end close)
                (treesit-node-end node))))))
     (save-excursion (goto-char end) (skip-chars-backward " \t\n") (point)))))
 
