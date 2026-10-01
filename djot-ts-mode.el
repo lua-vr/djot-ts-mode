@@ -30,12 +30,24 @@
 (defface djot-ts-code-block-delimiter '((t :inherit org-block-begin-line))
   "Face for the opening and closing lines of code and raw blocks.")
 
+(defun djot-ts-mode--opener (node)
+  "Return the child of block NODE where its own syntax begins.
+This skips the block attributes and block quote markers before it.
+A block attribute is its own opener."
+  (if (equal (treesit-node-type node) "block_attribute")
+      node
+    (seq-find (lambda (child)
+                (not (member (treesit-node-type child)
+                             '("block_attribute" "block_quote_marker"))))
+              (treesit-node-children node)
+              node)))
+
 (defun djot-ts-mode--fontify-code-block (node override start end &rest _)
   "Give code or raw block NODE an Org-like background.
 The fence lines get `djot-ts-code-block-delimiter', the rest
 `djot-ts-code-block'.  OVERRIDE, START and END are as in
 `treesit-fontify-with-override'."
-  (let* ((beg (treesit-node-start node))
+  (let* ((beg (treesit-node-start (djot-ts-mode--opener node)))
          (fin (treesit-node-end node))
          (body (save-excursion (goto-char beg) (min fin (1+ (pos-eol)))))
          (closed (string-suffix-p "_end" (treesit-node-type
@@ -64,7 +76,7 @@ OVERRIDE, START and END are as in `treesit-fontify-with-override'."
          (level (string-search " " (treesit-node-text marker t)))
          (face (intern (format "outline-%d" (min (or level 1) 8)))))
     (treesit-fontify-with-override
-     (treesit-node-start node) (treesit-node-end node)
+     (treesit-node-start marker) (treesit-node-end node)
      face override start end)))
 
 (defvar djot-ts-mode--font-lock-settings
@@ -156,11 +168,30 @@ OVERRIDE, START and END are as in `treesit-fontify-with-override'."
               (content (treesit-node-child-by-field-name heading "content")))
     (string-trim (treesit-node-text content t))))
 
+;;; Outline
+
+;; Outline headings are the headings of sections, not the sections:
+;; a section starts at the block attributes above its heading.
+
+(defun djot-ts-mode--section-heading-p (node)
+  "Return non-nil if NODE is the heading of a section."
+  (and (equal (treesit-node-type node) "heading")
+       (equal (treesit-node-type (treesit-node-parent node)) "section")))
+
+(defun djot-ts-mode--outline-level ()
+  "Return the number of sections enclosing the heading at point."
+  (let ((node (treesit-node-at (pos-bol)))
+        (level 0))
+    (while (setq node (treesit-parent-until node "\\`section\\'"))
+      (setq level (1+ level)))
+    (max level 1)))
+
 ;;; Folding of blocks with hideshow
 
 ;; Top-level headings are `section' nodes and fold with outline.  Divs,
 ;; code blocks, raw blocks and headings inside divs (which the grammar
-;; does not wrap in sections) fold with hideshow.
+;; does not wrap in sections) fold with hideshow.  A block starts at its
+;; opener, after the block attributes it contains.
 
 (defconst djot-ts-mode--block-regexp
   "\\`\\(?:div\\|code_block\\|raw_block\\|block_attribute\\)\\'"
@@ -171,10 +202,27 @@ OVERRIDE, START and END are as in `treesit-fontify-with-override'."
   (and (equal (treesit-node-type node) "heading")
        (not (equal (treesit-node-type (treesit-node-parent node)) "section"))))
 
+(defun djot-ts-mode--multiline-p (node)
+  "Return non-nil if NODE ends on a later line than it starts."
+  (save-excursion
+    (goto-char (treesit-node-start node))
+    (< (pos-eol) (treesit-node-start (treesit-node-child node -1)))))
+
 (defun djot-ts-mode--foldable-p (node)
-  "Return non-nil if NODE is folded by hideshow."
-  (or (string-match-p djot-ts-mode--block-regexp (treesit-node-type node))
-      (djot-ts-mode--nested-heading-p node)))
+  "Return non-nil if NODE is folded by hideshow.
+A one-line block attribute is not, so its block folds instead."
+  (if (equal (treesit-node-type node) "block_attribute")
+      (djot-ts-mode--multiline-p node)
+    (or (string-match-p djot-ts-mode--block-regexp (treesit-node-type node))
+        (djot-ts-mode--nested-heading-p node))))
+
+(defun djot-ts-mode--opener-p (node)
+  "Return non-nil if NODE is the opener of a foldable block."
+  (if (equal (treesit-node-type node) "block_attribute")
+      (djot-ts-mode--foldable-p node)
+    (when-let* ((parent (treesit-node-parent node)))
+      (and (djot-ts-mode--foldable-p parent)
+           (treesit-node-eq node (djot-ts-mode--opener parent))))))
 
 (defun djot-ts-mode--heading-level (node)
   "Return the level of heading NODE."
@@ -232,8 +280,29 @@ if any.  For `hs-find-block-beginning-function'."
                          (>= (djot-ts-mode--fold-end sib) pos))
                 (setq found sib)))
             (when found (setq node found))))))
-    (goto-char (treesit-node-start node))
+    (goto-char (treesit-node-start (djot-ts-mode--opener node)))
     t))
+
+(defun djot-ts-mode--hs-looking-at-block-start ()
+  "Return non-nil if a block opener starts at point.
+For `hs-looking-at-block-start-predicate'."
+  (when-let* ((opener (treesit-thing-at (point) #'djot-ts-mode--opener-p))
+              ((= (treesit-node-start opener) (point))))
+    (set-match-data (list (point) (min (1+ (point)) (point-max))))
+    t))
+
+(defun djot-ts-mode--hs-find-next-block (_regexp maxp _comments)
+  "Move past the start of the next block opener before MAXP.
+For `hs-find-next-block-function'."
+  (let* ((current (treesit-thing-at (point) #'djot-ts-mode--opener-p))
+         (beg (if (and current (= (treesit-node-start current) (point)))
+                  (point)
+                (treesit-navigate-thing (point) 1 'beg #'djot-ts-mode--opener-p)))
+         (end (and beg (min (1+ beg) (point-max)))))
+    (when (and end (<= end maxp))
+      (goto-char end)
+      (set-match-data (list beg end beg end))
+      t)))
 
 (defun djot-ts-mode--outline-toggle ()
   "Toggle the body of the current section, keeping its children's state.
@@ -291,20 +360,21 @@ blocks and block attributes, and outline elsewhere."
     (setq-local treesit-defun-name-function #'djot-ts-mode--heading-name
                 treesit-simple-imenu-settings
                 '((nil "\\`section\\'" nil nil))
-                treesit-outline-predicate "\\`section\\'")
+                treesit-outline-predicate #'djot-ts-mode--section-heading-p)
     (treesit-major-mode-setup)
     ;; `outline-mode' sets these already, so `treesit-major-mode-setup'
     ;; leaves them alone.
     (setq-local outline-search-function #'treesit-outline-search
-                outline-level #'treesit-outline-level)
+                outline-level #'djot-ts-mode--outline-level)
     (setq-local hs-treesit-things #'djot-ts-mode--foldable-p
                 hs-c-start-regexp nil
                 hs-block-start-regexp nil
                 hs-block-end-regexp #'djot-ts-mode--hs-block-end
                 hs-forward-sexp-function #'djot-ts-mode--hs-forward
                 hs-find-block-beginning-function #'djot-ts-mode--hs-find-block-beginning
-                hs-find-next-block-function #'treesit-hs-find-next-block
-                hs-looking-at-block-start-predicate #'treesit-hs-looking-at-block-start-p
+                hs-find-next-block-function #'djot-ts-mode--hs-find-next-block
+                hs-looking-at-block-start-predicate
+                #'djot-ts-mode--hs-looking-at-block-start
                 hs-inside-comment-predicate #'ignore)
     (setq-local hs-allow-nesting t)
     (hs-minor-mode)))
