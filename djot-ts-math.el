@@ -40,6 +40,16 @@ the same line is shown on the previous, resp. next line.  The buffer
 text is not changed."
   :type 'boolean)
 
+(defcustom djot-ts-math-live-preview t
+  "Non-nil means preview the math being edited next to its source.
+Inline math is previewed after its closing delimiter, display math on
+the next line."
+  :type 'boolean)
+
+(defcustom djot-ts-math-live-delay 0.3
+  "Seconds without edits before the math being edited is re-rendered."
+  :type 'number)
+
 (defvar djot-ts-math--backends nil
   "Alist of (NAME . PLIST), see `djot-ts-math-define-backend'.")
 
@@ -54,7 +64,8 @@ text is not changed."
                  returns; the images may arrive later.
 :overlay-p OV    Required.  Non-nil if OV is a preview overlay.
 :reveal OV       Required.  Show the source under OV.  It must stay
-                 shown if OV's image arrives later.
+                 shown if OV's image arrives later, also when OV is
+                 placed again (live preview of the math being edited).
 :conceal OV      Required.  Show OV's image.
 :image OV        Optional.  Return OV's image spec, or nil if it has
                  none yet.  Needed to center and break display math.
@@ -85,6 +96,18 @@ the overlay when they do."
 
 (defvar-local djot-ts-math--layouts nil
   "Layout overlays, see `djot-ts-math--layout'.")
+
+(defvar-local djot-ts-math--live-watch nil
+  "Overlay over the math being edited; its changes trigger re-rendering.")
+
+(defvar-local djot-ts-math--live-show nil
+  "Empty overlay showing the live preview.")
+
+(defvar-local djot-ts-math--live-timer nil
+  "Debounce timer for re-rendering the math being edited.")
+
+(defvar-local djot-ts-math--live-ov nil
+  "Preview overlay of the math being edited, or nil.")
 
 (defvar djot-ts-math--query nil
   "Compiled query for math nodes.")
@@ -137,6 +160,11 @@ the overlay when they do."
     (treesit-parent-until
      math (lambda (n) (equal (treesit-node-type n) "paragraph")))))
 
+(defun djot-ts-math--center-space (img)
+  "Return a space that centers IMG following it."
+  (propertize " " 'face 'default
+              'display `(space :align-to (- center (0.55 . ,img)))))
+
 (defun djot-ts-math--layout-strings (ov)
   "Return (BEFORE . AFTER) strings laying out the preview OV, or nil.
 Only display math with an image is laid out."
@@ -157,9 +185,7 @@ Only display math with an image is laid out."
            (before (concat
                     (and break (not alone-before) "\n")
                     (and djot-ts-math-center-display (or break alone-before)
-                         (propertize
-                          " " 'face 'default
-                          'display `(space :align-to (- center (0.55 . ,img)))))))
+                         (djot-ts-math--center-space img))))
            (after (and break (not alone-after) "\n")))
       (unless (and (string-empty-p before) (null after))
         (cons (and (not (string-empty-p before)) before) after)))))
@@ -198,9 +224,10 @@ Backends call this when an image arrives, see
 `djot-ts-math-define-backend'."
   (when-let* ((buf (overlay-buffer ov)))
     (with-current-buffer buf
-      (when (and djot-ts-math-mode
-                 (not (memq ov djot-ts-math--revealed)))
-        (djot-ts-math--layout ov)))))
+      (when djot-ts-math-mode
+        (cond ((eq ov djot-ts-math--live-ov) (djot-ts-math--live-display))
+              ((not (memq ov djot-ts-math--revealed))
+               (djot-ts-math--layout ov)))))))
 
 (defun djot-ts-math--place (entries)
   "Preview ENTRIES, skipping those whose preview is up to date."
@@ -240,7 +267,8 @@ That fragment stays dirty."
   (let* ((beg (car djot-ts-math--dirty))
          (end (cdr djot-ts-math--dirty))
          (frags (djot-ts-math--fragments beg end))
-         (here (seq-find (lambda (f) (<= (nth 0 f) pt (nth 1 f))) frags)))
+         (here (seq-find (lambda (f) (and (<= (nth 0 f) pt) (< pt (nth 1 f))))
+                         frags)))
     (dolist (ov (djot-ts-math--overlays beg end))
       (unless (seq-find (lambda (f) (and (= (nth 0 f) (overlay-start ov))
                                          (= (nth 1 f) (overlay-end ov))))
@@ -269,6 +297,113 @@ That fragment stays dirty."
         (djot-ts-math--call :reveal o)))
     (setq djot-ts-math--revealed new)))
 
+;;;; Live preview of the math being edited
+
+(defun djot-ts-math--fragment-at (pt)
+  "Return the entry of the math containing PT, or nil.
+As for overlays, the math's end position is not contained."
+  (seq-find (lambda (f) (and (<= (nth 0 f) pt) (< pt (nth 1 f))))
+            (djot-ts-math--fragments (max (point-min) (1- pt))
+                                     (min (point-max) (1+ pt)))))
+
+(defun djot-ts-math--live-string (img display end)
+  "Return the string showing IMG after math ending at END.
+DISPLAY non-nil means display math, shown on its own line."
+  (let ((s (propertize " " 'display img)))
+    (if (not display)
+        s
+      (concat "\n"
+              (and djot-ts-math-center-display (djot-ts-math--center-space img))
+              s
+              (and (save-excursion (goto-char end)
+                                   (skip-chars-forward " \t")
+                                   (not (eolp)))
+                   "\n")))))
+
+(defun djot-ts-math--live-display ()
+  "Show the image of `djot-ts-math--live-ov' in the live preview.
+Keep the previous image if there is none yet."
+  (when-let* ((show djot-ts-math--live-show)
+              ((overlay-buffer show))
+              (ov djot-ts-math--live-ov)
+              ((overlay-buffer ov))
+              (img (djot-ts-math--call :image ov)))
+    (overlay-put show 'after-string
+                 (djot-ts-math--live-string
+                  img (overlay-get show 'djot-ts-math-display)
+                  (overlay-start show)))))
+
+(defun djot-ts-math--live-render (buf)
+  "Render the math at point in BUF, keeping its source shown."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (setq djot-ts-math--live-timer nil)
+      (when djot-ts-math-mode
+        (with-demoted-errors "djot-ts-math: %S"
+          (treesit-parser-root-node djot-ts-math--parser)
+          (when-let* ((f (djot-ts-math--fragment-at (point))))
+            (djot-ts-math--place (list f))
+            (when-let* ((ov (djot-ts-math--overlay (nth 0 f) (nth 1 f))))
+              (unless (memq ov djot-ts-math--revealed)
+                (djot-ts-math--unlayout ov)
+                (djot-ts-math--call :reveal ov)
+                (push ov djot-ts-math--revealed))
+              (setq djot-ts-math--live-ov ov)
+              (djot-ts-math--live-display))))))))
+
+(defun djot-ts-math--live-schedule ()
+  "Re-render the math at point after `djot-ts-math-live-delay'."
+  (when (timerp djot-ts-math--live-timer)
+    (cancel-timer djot-ts-math--live-timer))
+  (setq djot-ts-math--live-timer
+        (run-with-timer djot-ts-math-live-delay nil
+                        #'djot-ts-math--live-render (current-buffer))))
+
+(defun djot-ts-math--live-changed (_ov after &rest _)
+  "Overlay modification hook: debounce re-rendering if AFTER."
+  (when after
+    (djot-ts-math--live-schedule)))
+
+(defun djot-ts-math--live-stop ()
+  "Remove the live preview."
+  (when (timerp djot-ts-math--live-timer)
+    (cancel-timer djot-ts-math--live-timer))
+  (when djot-ts-math--live-watch (delete-overlay djot-ts-math--live-watch))
+  (when djot-ts-math--live-show (delete-overlay djot-ts-math--live-show))
+  (setq djot-ts-math--live-timer nil
+        djot-ts-math--live-watch nil
+        djot-ts-math--live-show nil
+        djot-ts-math--live-ov nil))
+
+(defun djot-ts-math--live-update (pt)
+  "Track the math at PT for the live preview."
+  (if-let* ((f (and djot-ts-math-live-preview (djot-ts-math--fragment-at pt))))
+      (pcase-let* ((`(,beg ,end ,tex ,display) f)
+                   (watch djot-ts-math--live-watch)
+                   (show djot-ts-math--live-show)
+                   (ov (or (djot-ts-math--overlay beg end)
+                           (seq-find (lambda (o) (djot-ts-math--call :overlay-p o))
+                                     (overlays-at pt)))))
+        (if (and watch (overlay-buffer watch))
+            (move-overlay watch beg end)
+          (setq watch (make-overlay beg end nil t))
+          (overlay-put watch 'modification-hooks '(djot-ts-math--live-changed))
+          (setq djot-ts-math--live-watch watch))
+        (if (and show (overlay-buffer show))
+            (move-overlay show end end)
+          (setq djot-ts-math--live-show (make-overlay end end)))
+        (overlay-put djot-ts-math--live-show 'djot-ts-math-display display)
+        (unless (eq ov djot-ts-math--live-ov)
+          (overlay-put djot-ts-math--live-show 'after-string nil)
+          (setq djot-ts-math--live-ov ov))
+        (djot-ts-math--live-display)
+        ;; New math, or math changed before it was tracked.
+        (unless (or djot-ts-math--live-timer
+                    (and ov (equal (overlay-get ov 'djot-ts-math-source)
+                                   (list tex display))))
+          (djot-ts-math--live-schedule)))
+    (djot-ts-math--live-stop)))
+
 (defun djot-ts-math--post-command ()
   "Re-render edited math and update the revealed previews."
   (with-demoted-errors "djot-ts-math: %S"
@@ -277,7 +412,8 @@ That fragment stays dirty."
     (djot-ts-math--gc-layouts)
     (when djot-ts-math--dirty
       (djot-ts-math--refresh (point)))
-    (djot-ts-math--update-reveal (point))))
+    (djot-ts-math--update-reveal (point))
+    (djot-ts-math--live-update (point))))
 
 ;;;###autoload
 (define-minor-mode djot-ts-math-mode
@@ -296,7 +432,9 @@ The images are made by `djot-ts-math-backend'."
         (add-hook 'after-change-functions #'djot-ts-math--after-change nil t)
         (add-hook 'post-command-hook #'djot-ts-math--post-command nil t)
         (djot-ts-math--place (djot-ts-math--fragments))
-        (djot-ts-math--update-reveal (point)))
+        (djot-ts-math--update-reveal (point))
+        (djot-ts-math--live-update (point)))
+    (djot-ts-math--live-stop)
     (remove-hook 'after-change-functions #'djot-ts-math--after-change t)
     (remove-hook 'post-command-hook #'djot-ts-math--post-command t)
     (when (treesit-parser-p djot-ts-math--parser)
