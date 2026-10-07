@@ -16,6 +16,11 @@
 ;; that faces and invisible text (e.g. of `djot-ts-appear-mode') are
 ;; measured as displayed.  Whatever refontifies a table realigns it.
 ;; Alignment uses overlays, which font-lock leaves alone.
+;;
+;; Tables wider than the window are shrunk to fit: the widest columns
+;; are cut to a common width, ending in `djot-ts-table-ellipsis'.  The
+;; cell at point is shown in full, pushing the rest of its row to the
+;; right; the full text of a cut cell is also its tooltip.
 
 ;;; Code:
 
@@ -24,6 +29,13 @@
 
 (defvar-local djot-ts-table--query nil
   "Compiled query for table nodes.")
+
+(defvar-local djot-ts-table--current nil
+  "(TBEG TEND (CBEG . CEND)): bounds of the table and the cell at point.
+Nil if point is not in a content cell.")
+
+(defconst djot-ts-table-ellipsis "…"
+  "String shown in place of the cut end of a shrunk cell.")
 
 (defun djot-ts-table--width (from to win)
   "Return the pixel width of the text from FROM to TO, as shown in WIN.
@@ -131,34 +143,111 @@ Each row gets an :aligns list, see `djot-ts-table--alignment'."
         (push (plist-put row :aligns aligns) rows)))
     (nreverse rows)))
 
+(defun djot-ts-table--pipes (rows ncols &optional cap)
+  "Return a vector of the pixel positions of the pipes after each column.
+With CAP, content cells take at most CAP pixels.  A cell with
+:expanded counts as that many pixels wide."
+  (let ((pipes (make-vector ncols 0))
+        (starts (mapcar (lambda (r) (plist-get r :x0)) rows)))
+    (dotimes (j ncols)
+      (seq-mapn (lambda (r x)
+                  (when-let* ((c (nth j (plist-get r :cells))))
+                    (let ((need (or (plist-get c :expanded) (plist-get c :need))))
+                      (when (and cap (not (plist-get r :sep)))
+                        (setq need (min need cap)))
+                      (aset pipes j (max (aref pipes j) (+ x need))))))
+                rows starts)
+      (setq starts (mapcar (lambda (r) (+ (aref pipes j) (plist-get r :pipe)))
+                           rows)))
+    pipes))
+
+(defun djot-ts-table--cap (rows ncols win s)
+  "Return the widest content cell width fitting ROWS in WIN, or nil.
+Nil means the table fits unshrunk.  S is the width of a space.  The
+cap is at least two characters plus padding."
+  (let* ((avail (- (window-body-width win t) s
+                   (if display-line-numbers (line-number-display-width t) 0)))
+         (pipe (seq-max (mapcar (lambda (r) (plist-get r :pipe)) rows)))
+         (fits (lambda (cap)
+                 (<= (+ (aref (djot-ts-table--pipes rows ncols cap) (1- ncols))
+                        pipe)
+                     avail))))
+    (unless (funcall fits nil)
+      (let ((lo (* 4 s))
+            (hi (seq-max (mapcar (lambda (r) (if (plist-get r :sep) 0
+                                               (seq-max (mapcar (lambda (c) (plist-get c :need))
+                                                                (plist-get r :cells)))))
+                                 rows))))
+        (while (< lo hi)
+          (let ((mid (/ (+ lo hi 1) 2)))
+            (if (funcall fits mid) (setq lo mid) (setq hi (1- mid)))))
+        lo))))
+
+(defun djot-ts-table--shrink (cell width win ew &optional measure)
+  "Cut content CELL to show at most WIDTH pixels in WIN.
+EW is the width of `djot-ts-table-ellipsis'.  Update the widths of
+CELL to the shrunk ones.  Return the shrunk :need.  With MEASURE,
+only return it."
+  (let* ((beg (plist-get cell :cbeg))
+         (end (plist-get cell :cend))
+         (lo beg)
+         (hi end))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi 1) 2)))
+        (if (<= (+ (djot-ts-table--width beg mid win) ew) width)
+            (setq lo mid)
+          (setq hi (1- mid)))))
+    (let* ((w (+ (djot-ts-table--width beg lo win) ew))
+           (need (+ (plist-get cell :need) (- w (plist-get cell :w)))))
+      (unless measure
+        (let ((ov (djot-ts-table--overlay lo end 'display djot-ts-table-ellipsis)))
+          (overlay-put ov 'evaporate t)
+          (overlay-put ov 'help-echo (buffer-substring-no-properties beg end)))
+        (plist-put cell :need need)
+        (plist-put cell :w w))
+      need)))
+
 (defun djot-ts-table--align (table)
-  "Align the pipe table node TABLE."
+  "Align the pipe table node TABLE.
+Shrink it to fit its window, except for the cell in
+`djot-ts-table--current', which pushes the rest of its row to the
+right."
   (let* ((tbeg (treesit-node-start table))
          (tend (treesit-node-end table))
+         ;; Not point: under jit-lock, point is wherever earlier
+         ;; fontification functions left it.
+         (pt (car (nth 2 djot-ts-table--current)))
          (win (get-buffer-window (current-buffer) t))
          (s (djot-ts-table--space-width win))
-         rows starts pipes)
+         rows ncols cap pipes)
     ;; Measure without our overlays.
     (djot-ts-table--remove tbeg tend)
     (setq rows (djot-ts-table--rows table win))
+    (setq ncols (seq-max (cons 0 (mapcar (lambda (r) (length (plist-get r :cells)))
+                                         rows))))
+    (when (and win (> ncols 0))
+      (setq cap (djot-ts-table--cap rows ncols win s)))
+    (when cap
+      (let ((ew (string-pixel-width djot-ts-table-ellipsis (current-buffer))))
+        (dolist (r rows)
+          (unless (plist-get r :sep)
+            (dolist (c (plist-get r :cells))
+              (when (> (plist-get c :need) cap)
+                (if (and pt (<= (plist-get c :beg) pt (plist-get c :end)))
+                    (plist-put c :expanded
+                               (djot-ts-table--shrink c (- cap (* 2 s)) win ew t))
+                  (djot-ts-table--shrink c (- cap (* 2 s)) win ew))))))))
     ;; Column J ends at pixel (aref pipes J), where the next pipe starts.
-    ;; Each row's cell J starts at (car (nth J starts-of-row)).
-    (let ((ncols (seq-max (cons 0 (mapcar (lambda (r) (length (plist-get r :cells)))
-                                           rows)))))
-      (setq pipes (make-vector ncols 0)
-            starts (mapcar (lambda (r) (plist-get r :x0)) rows))
-      (dotimes (j ncols)
-        (seq-mapn (lambda (r x)
-                    (when-let* ((c (nth j (plist-get r :cells))))
-                      (aset pipes j (max (aref pipes j) (+ x (plist-get c :need))))))
-                  rows starts)
-        (setq starts (mapcar (lambda (r) (+ (aref pipes j) (plist-get r :pipe)))
-                             rows))))
+    (setq pipes (djot-ts-table--pipes rows ncols))
     (dolist (r rows)
-      (let ((x (plist-get r :x0)) (j 0))
+      ;; SHIFT is how far an expanded cell pushed the rest of the row.
+      (let ((x (plist-get r :x0)) (j 0) (shift 0))
         (dolist (c (plist-get r :cells))
-          (let ((pipe (aref pipes j))
+          (let ((pipe (+ (aref pipes j) shift))
                 (align (nth j (plist-get r :aligns))))
+            (when (> (+ x (plist-get c :need)) pipe)
+              (setq shift (+ shift (- (+ x (plist-get c :need)) pipe))
+                    pipe (+ x (plist-get c :need))))
             (if (plist-get r :sep)
                 (let* ((dashw (plist-get c :dashw))
                        (n (floor (- pipe x (plist-get c :natural)) dashw))
@@ -199,6 +288,41 @@ Also delete the table overlays left there by removed tables."
         (djot-ts-table--remove beg end)
         (mapc #'djot-ts-table--align (djot-ts-table--tables beg end))))))
 
+(defun djot-ts-table--at (pos)
+  "Return the table node containing POS, or nil."
+  (seq-find (lambda (tb) (<= (treesit-node-start tb) pos (treesit-node-end tb)))
+            (djot-ts-table--tables (max (point-min) (1- pos))
+                                   (min (point-max) (1+ pos)))))
+
+(defun djot-ts-table--cell-at (table pos)
+  "Return the bounds (BEG . END) of the content cell of TABLE at POS, or nil."
+  (catch 'found
+    (dolist (row (treesit-node-children table t))
+      (when (member (treesit-node-type row) '("table_header" "table_row"))
+        (dolist (c (treesit-node-children row t))
+          (when (<= (treesit-node-start c) pos (treesit-node-end c))
+            (throw 'found (cons (treesit-node-start c) (treesit-node-end c)))))))))
+
+(defun djot-ts-table--post-command ()
+  "Realign tables when point enters or leaves a cell.
+The cell at point is shown unshrunk."
+  (with-demoted-errors "djot-ts-table: %S"
+    (let* ((tb (djot-ts-table--at (point)))
+           (cell (and tb (djot-ts-table--cell-at tb (point))))
+           (new (and cell (list (treesit-node-start tb) (treesit-node-end tb) cell)))
+           (old djot-ts-table--current))
+      (unless (equal new old)
+        (setq djot-ts-table--current new)
+        (dolist (b (seq-uniq (delq nil (list (take 2 old) (take 2 new)))))
+          (when b
+            (djot-ts-table--align-region (min (car b) (point-max))
+                                         (min (cadr b) (point-max)))))))))
+
+(defun djot-ts-table--window-size-change (win)
+  "Realign the tables of WIN's buffer to its new width."
+  (with-current-buffer (window-buffer win)
+    (djot-ts-table-align)))
+
 (defun djot-ts-table-align ()
   "Align all tables in the buffer.
 Useful after changing fonts; edits and refontification realign
@@ -231,10 +355,17 @@ The buffer text is not changed."
         (add-hook 'jit-lock-functions #'djot-ts-table--jit 90 t)
         (dolist (h djot-ts-table--realign-hooks)
           (add-hook h #'djot-ts-table-align nil t))
+        (add-hook 'post-command-hook #'djot-ts-table--post-command nil t)
+        (add-hook 'window-size-change-functions
+                  #'djot-ts-table--window-size-change nil t)
         (djot-ts-table-align))
     (remove-hook 'jit-lock-functions #'djot-ts-table--jit t)
     (dolist (h djot-ts-table--realign-hooks)
       (remove-hook h #'djot-ts-table-align t))
+    (remove-hook 'post-command-hook #'djot-ts-table--post-command t)
+    (remove-hook 'window-size-change-functions
+                 #'djot-ts-table--window-size-change t)
+    (setq djot-ts-table--current nil)
     (save-restriction
       (widen)
       (djot-ts-table--remove (point-min) (point-max)))))
