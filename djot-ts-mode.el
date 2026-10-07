@@ -363,7 +363,7 @@ blocks and block attributes, and outline elsewhere."
 (defvar-keymap djot-ts-mode-map
   :doc "Keymap for `djot-ts-mode'."
   :parent outline-mode-map
-  "<tab>" #'djot-ts-mode-toggle)
+  "C-c <tab>" #'djot-ts-mode-toggle)
 
 ;;;###autoload
 (define-derived-mode djot-ts-mode outline-mode "Djot"
