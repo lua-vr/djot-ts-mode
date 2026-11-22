@@ -134,9 +134,23 @@ and block quote markers repeated."
                          (min (point-max) (cdr range))
                          'fontified nil))))
 
+(defun djot-ts-indent--remove-properties (string)
+  "Remove the indentation properties from STRING and return it."
+  (remove-text-properties 0 (length string)
+                          '(line-prefix nil wrap-prefix nil) string)
+  string)
+
+(defvar-local djot-ts-indent--disabled-modes nil
+  "Wrap prefix modes that `djot-ts-indent-mode' turned off.")
+
+(defconst djot-ts-indent--conflicting-modes
+  '(adaptive-wrap-prefix-mode visual-wrap-prefix-mode)
+  "Modes that also set `wrap-prefix' and would override ours.")
+
 ;;;###autoload
 (define-minor-mode djot-ts-indent-mode
-  "Indent the text under Djot headings by section depth, for display only."
+  "Indent the text under Djot headings by section depth, for display only.
+Turns off the modes in `djot-ts-indent--conflicting-modes' while enabled."
   :lighter " Ind"
   (let ((parser (car (treesit-parser-list nil 'djot))))
     (cond
@@ -144,16 +158,27 @@ and block quote markers repeated."
       (setq djot-ts-indent-mode nil)
       (user-error "No Djot parser in this buffer"))
      (djot-ts-indent-mode
+      (dolist (mode djot-ts-indent--conflicting-modes)
+        (when (and (boundp mode) (symbol-value mode))
+          (funcall mode -1)
+          (push mode djot-ts-indent--disabled-modes)))
       (treesit-parser-add-notifier parser #'djot-ts-indent--notify)
+      (add-function :filter-return (local 'filter-buffer-substring-function)
+                    #'djot-ts-indent--remove-properties)
       (jit-lock-register #'djot-ts-indent--fontify)
       (jit-lock-refontify))
      (t
       (when parser
         (treesit-parser-remove-notifier parser #'djot-ts-indent--notify))
+      (remove-function (local 'filter-buffer-substring-function)
+                       #'djot-ts-indent--remove-properties)
       (jit-lock-unregister #'djot-ts-indent--fontify)
       (with-silent-modifications
         (remove-text-properties (point-min) (point-max)
-                                '(line-prefix nil wrap-prefix nil)))))))
+                                '(line-prefix nil wrap-prefix nil)))
+      (dolist (mode djot-ts-indent--disabled-modes)
+        (funcall mode 1))
+      (setq djot-ts-indent--disabled-modes nil)))))
 
 (provide 'djot-ts-indent)
 ;;; djot-ts-indent.el ends here
