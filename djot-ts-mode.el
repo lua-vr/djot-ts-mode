@@ -16,6 +16,7 @@
 (require 'outline)
 (require 'hideshow)
 (require 'org-faces)
+(require 'djot-ts-code)
 
 (defgroup djot-ts nil
   "Tree-sitter support for Djot."
@@ -54,8 +55,9 @@ A block attribute is its own opener."
 (defun djot-ts-mode--fontify-code-block (node override start end &rest _)
   "Give code or raw block NODE an Org-like background.
 The fence lines get `djot-ts-code-block-delimiter', the rest
-`djot-ts-code-block'.  OVERRIDE, START and END are as in
-`treesit-fontify-with-override'."
+`djot-ts-code-block', appended to the faces of the code's language.
+OVERRIDE, START and END are as in `treesit-fontify-with-override';
+OVERRIDE applies to the fence lines."
   (let* ((beg (treesit-node-start (djot-ts-mode--opener node)))
          (fin (treesit-node-end node))
          (body (save-excursion (goto-char beg) (min fin (1+ (pos-eol)))))
@@ -67,7 +69,7 @@ The fence lines get `djot-ts-code-block-delimiter', the rest
     (treesit-fontify-with-override
      beg body 'djot-ts-code-block-delimiter override start end)
     (treesit-fontify-with-override
-     body tail 'djot-ts-code-block override start end)
+     body tail 'djot-ts-code-block 'append start end)
     (when closed
       (treesit-fontify-with-override
        tail fin 'djot-ts-code-block-delimiter override start end))))
@@ -386,6 +388,7 @@ blocks and block attributes, and outline elsewhere."
                 treesit-simple-imenu-settings
                 '((nil "\\`section\\'" nil nil))
                 treesit-outline-predicate #'djot-ts-mode--section-heading-p)
+    (djot-ts-code-setup)
     (treesit-major-mode-setup)
     ;; `outline-mode' sets these already, so `treesit-major-mode-setup'
     ;; leaves them alone.
