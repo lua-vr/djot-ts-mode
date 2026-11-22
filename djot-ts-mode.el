@@ -362,6 +362,47 @@ blocks and block attributes, and outline elsewhere."
       (hs-toggle-hiding)
     (djot-ts-mode--outline-toggle)))
 
+;;; Folding by class
+
+(defcustom djot-ts-mode-fold-class "fold"
+  "Class of the blocks and sections folded when the mode starts.
+A div `::: CLASS' also counts.  If nil, fold nothing."
+  :type '(choice (const :tag "None" nil) string)
+  :group 'djot-ts)
+
+(defun djot-ts-mode--fold-class-nodes ()
+  "Return the nodes with class `djot-ts-mode-fold-class', last first."
+  (let* ((root (treesit-buffer-root-node 'djot))
+         (class (concat "." djot-ts-mode-fold-class))
+         nodes)
+    (pcase-dolist (`(_ . ,node) (treesit-query-capture root '((class) @c)))
+      (when-let* (((equal (treesit-node-text node t) class))
+                  (attr (treesit-parent-until node "\\`block_attribute\\'")))
+        (push (treesit-node-parent attr) nodes)))
+    (pcase-dolist (`(_ . ,node) (treesit-query-capture root '((class_name) @c)))
+      (when (equal (treesit-node-text node t) djot-ts-mode-fold-class)
+        (push (treesit-node-parent node) nodes)))
+    (sort (delq nil nodes)
+          (lambda (a b) (> (treesit-node-start a) (treesit-node-start b))))))
+
+(defun djot-ts-mode-hide-fold-class ()
+  "Fold the blocks and sections with class `djot-ts-mode-fold-class'."
+  (interactive)
+  (when djot-ts-mode-fold-class
+    (save-excursion
+      (dolist (node (djot-ts-mode--fold-class-nodes))
+        (cond
+         ((equal (treesit-node-type node) "section")
+          (goto-char (treesit-node-start
+                      (treesit-node-child-by-field-name node "heading")))
+          (unless (outline-invisible-p (pos-eol))
+            (djot-ts-mode--outline-toggle)))
+         ((and (djot-ts-mode--foldable-p node)
+               (not (equal (treesit-node-type node) "block_attribute")))
+          (goto-char (treesit-node-start (djot-ts-mode--opener node)))
+          (unless (hs-already-hidden-p)
+            (hs-hide-block))))))))
+
 (defvar-keymap djot-ts-mode-map
   :doc "Keymap for `djot-ts-mode'."
   :parent outline-mode-map
@@ -405,7 +446,8 @@ blocks and block attributes, and outline elsewhere."
                 #'djot-ts-mode--hs-looking-at-block-start
                 hs-inside-comment-predicate #'ignore)
     (setq-local hs-allow-nesting t)
-    (hs-minor-mode)))
+    (hs-minor-mode)
+    (djot-ts-mode-hide-fold-class)))
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.dj\\'" . djot-ts-mode))
