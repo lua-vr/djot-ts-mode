@@ -26,9 +26,12 @@
 ;; so realigning a table only measures its changed rows.
 ;;
 ;; Tables wider than the window are shrunk to fit: the widest columns
-;; are cut to a common width, ending in `djot-ts-table-ellipsis'.  The
-;; cell at point is shown in full, pushing the rest of its row to the
-;; right; the full text of a cut cell is also its tooltip.
+;; are narrowed to a common width and the text of their cells wraps.
+;; A row with wrapped cells is replaced by one multi-line string,
+;; built from copies of its text with their text properties
+;; and the `display' and `invisible' properties of overlays within.
+;; The row at point is shown unwrapped, its overflowing cells pushing
+;; the rest of the row to the right.
 
 ;;; Code:
 
@@ -40,8 +43,8 @@
   "Compiled query for table nodes.")
 
 (defvar-local djot-ts-table--current nil
-  "(TBEG TEND (CBEG . CEND)): bounds of the table and the cell at point.
-Nil if point is not in a content cell.")
+  "(TBEG TEND (RBEG . EOL)): bounds of the table and the row at point.
+Nil if point is not on a content row.")
 
 (defvar-local djot-ts-table--body-width nil
   "Body width in pixels of the window that tables were aligned for.")
@@ -49,9 +52,6 @@ Nil if point is not in a content cell.")
 (defvar djot-ts-table--busy nil
   "Start positions of the tables being fontified to be aligned.
 Fontifying them runs `djot-ts-table--jit', which skips them.")
-
-(defconst djot-ts-table-ellipsis "…"
-  "String shown in place of the cut end of a shrunk cell.")
 
 (defface djot-ts-table-border '((t :inherit (shadow fixed-pitch) :weight normal))
   "Face of the box-drawing characters shown for pipes and dashes.
@@ -225,14 +225,18 @@ pipes."
     (overlay-put ov prop value)
     ov))
 
+(defun djot-ts-table--align-to (x)
+  "Return a string shown as space up to pixel X."
+  (propertize " " 'display `(space :align-to (,(round x)))))
+
 (defun djot-ts-table--space (beg end x)
   "Show the text from BEG to END as space up to pixel X.
 If BEG = END, insert that space at BEG instead."
-  (let ((spec `(space :align-to (,(round x)))))
-    (if (< beg end)
-        (overlay-put (djot-ts-table--overlay beg end 'display spec) 'evaporate t)
-      (djot-ts-table--overlay beg beg 'before-string
-                              (propertize " " 'display spec)))))
+  (if (< beg end)
+      (overlay-put (djot-ts-table--overlay beg end 'display
+                                           `(space :align-to (,(round x))))
+                   'evaporate t)
+    (djot-ts-table--overlay beg beg 'before-string (djot-ts-table--align-to x))))
 
 (defun djot-ts-table--glyph (pos str)
   "Show the pipe at POS as STR."
@@ -309,44 +313,137 @@ at least two characters plus padding."
           (setq hi (1- mid)))))
     lo))
 
-(defun djot-ts-table--cut (m rbeg width win ew)
-  "Return (POS . W) to show content cell M of the row at RBEG in WIDTH.
-M is a cell measurement, see `djot-ts-table--measure-row'.  The text
-from POS, relative to RBEG, is replaced by an ellipsis EW pixels
-wide; W is the width of the shown text, ellipsis included.  The
-result is cached in M."
-  (let ((cached (plist-get m :cut)))
-    (if (equal (car cached) (cons width ew))
+(defun djot-ts-table--unsplit (pos end)
+  "Return END, a line break after POS, moved out of `display' overlays.
+It moves to the start of an overlay around it if that is after POS,
+else past the character or `display' overlays at POS."
+  (let ((b end))
+    (dolist (o (overlays-at end))
+      (when (and (overlay-get o 'display) (< (overlay-start o) end))
+        (setq b (min b (overlay-start o)))))
+    (if (> b pos)
+        b
+      (seq-reduce (lambda (b o)
+                    (if (overlay-get o 'display) (max b (overlay-end o)) b))
+                  (overlays-at pos) (1+ pos)))))
+
+(defun djot-ts-table--wrap (m rbeg width win)
+  "Return the lines of content cell M of the row at RBEG wrapped to WIDTH.
+M is a cell measurement, see `djot-ts-table--measure-row'.  Each line
+is (FROM TO W): its bounds relative to RBEG and its pixel width in
+WIN.  Lines break at spaces, else inside words, and are wider than
+WIDTH only if a character or `display' overlay is.  The result is
+cached in M."
+  (let ((cached (plist-get m :wrap)))
+    (if (eql (car cached) width)
         (cdr cached)
-      (let* ((beg (+ rbeg (plist-get m :cbeg)))
-             (lo beg)
-             (hi (+ rbeg (plist-get m :cend))))
-        (while (< lo hi)
-          (let ((mid (/ (+ lo hi 1) 2)))
-            (if (<= (+ (djot-ts-table--width beg mid win) ew) width)
-                (setq lo mid)
-              (setq hi (1- mid)))))
-        (let ((res (cons (- lo rbeg) (+ (djot-ts-table--width beg lo win) ew))))
-          (plist-put m :cut (cons (cons width ew) res))
-          res)))))
+      (let ((pos (+ rbeg (plist-get m :cbeg)))
+            (cend (+ rbeg (plist-get m :cend)))
+            lines)
+        (while (< pos cend)
+          (let ((lo pos) (hi cend) end tend)
+            ;; LO: the furthest end of a line from POS fitting WIDTH.
+            (while (< lo hi)
+              (let ((mid (/ (+ lo hi 1) 2)))
+                (if (<= (djot-ts-table--width pos mid win) width)
+                    (setq lo mid)
+                  (setq hi (1- mid)))))
+            (setq end (if (or (= lo cend) (memq (char-after lo) '(?\s ?\t)))
+                          lo
+                        ;; Break before the word at LO, if it is not the first.
+                        (let ((wbeg (save-excursion
+                                      (goto-char lo) (skip-chars-backward "^ \t" pos)
+                                      (point))))
+                          (if (> wbeg pos) wbeg lo))))
+            (setq end (min cend (djot-ts-table--unsplit pos end))
+                  tend (save-excursion
+                         (goto-char end) (skip-chars-backward " \t" pos) (point)))
+            (push (list (- pos rbeg) (- tend rbeg) (djot-ts-table--width pos tend win))
+                  lines)
+            (setq pos (save-excursion
+                        (goto-char end) (skip-chars-forward " \t" cend) (point)))))
+        (setq lines (nreverse lines))
+        (plist-put m :wrap (cons width lines))
+        lines))))
+
+(defun djot-ts-table--text (from to)
+  "Return the text from FROM to TO with the properties shown there.
+These are its text properties and the `display' and `invisible'
+properties of the overlays within FROM..TO."
+  (let ((str (buffer-substring from to)))
+    (dolist (o (overlays-in from to))
+      (let ((b (overlay-start o)) (e (overlay-end o)))
+        (when (and (<= from b) (< b e) (<= e to))
+          (dolist (p '(display invisible))
+            (when-let* ((v (overlay-get o p)))
+              (put-text-property (- b from) (- e from) p v str))))))
+    str))
+
+(defun djot-ts-table--wrapped-row (r pipes s)
+  "Show row R with its wrapped cells, as one string in place of it.
+R is a row of `djot-ts-table--rows'; its cells with :lines are
+wrapped, see `djot-ts-table--wrap'.  Column J ends at pixel (aref
+PIPES J).  S is the width of a space."
+  (let* ((rbeg (plist-get r :beg))
+         (cells (plist-get r :cells))
+         (lines (mapcar (lambda (c)
+                          (let ((m (plist-get c :m)))
+                            (or (plist-get c :lines)
+                                (list (list (plist-get m :cbeg) (plist-get m :cend)
+                                            (plist-get m :w))))))
+                        cells))
+         (bar (propertize "│" 'face 'djot-ts-table-border))
+         (rend (+ rbeg (plist-get (plist-get (car (last cells)) :m) :end)))
+         strs)
+    (dotimes (k (seq-max (mapcar #'length lines)))
+      (unless (= k 0)
+        (push "\n" strs)
+        (push (djot-ts-table--align-to (- (plist-get r :x0) (plist-get r :pipe))) strs))
+      (push bar strs)
+      (let ((x (plist-get r :x0)) (j 0))
+        (dolist (c cells)
+          (let* ((line (nth k (nth j lines)))
+                 (pipe (aref pipes j))
+                 (free (- pipe x (* 2 s) (if line (nth 2 line) 0))))
+            (when line
+              (push (djot-ts-table--align-to
+                     (+ x s (pcase (nth j (plist-get r :aligns))
+                              ('right free)
+                              ('center (/ free 2.0))
+                              (_ 0))))
+                    strs)
+              (push (djot-ts-table--text (+ rbeg (car line)) (+ rbeg (nth 1 line)))
+                    strs))
+            (push (djot-ts-table--align-to pipe) strs)
+            (when (eq (char-after (+ rbeg (plist-get (plist-get c :m) :end))) ?|)
+              (push bar strs))
+            (setq x (+ pipe (plist-get r :pipe))
+                  j (1+ j))))))
+    ;; Not as the `display' string, as that ignores `display' properties
+    ;; within it.
+    (let ((ov (djot-ts-table--overlay
+               rbeg (if (eq (char-after rend) ?|) (1+ rend) rend) 'display "")))
+      (overlay-put ov 'before-string (apply #'concat (nreverse strs)))
+      (overlay-put ov 'evaporate t))))
 
 (defun djot-ts-table--align (table)
   "Align the pipe table node TABLE.
-Shrink it to fit its window, except for the cell in
-`djot-ts-table--current', which pushes the rest of its row to the
-right.  Record the measurements, the shrinking and the start of the
-cut cells in a `djot-ts-table-info' overlay over TABLE."
+Shrink it to fit its window by wrapping cells, except in the row in
+`djot-ts-table--current', whose overflowing cells push the rest of the
+row to the right.  Record the measurements, the shrinking and the
+starts of the rows with overflowing cells in a `djot-ts-table-info'
+overlay over TABLE."
   (let* ((tbeg (treesit-node-start table))
          (tend (treesit-node-end table))
          ;; Not point: under jit-lock, point is wherever earlier
          ;; fontification functions left it.
-         (pt (car (nth 2 djot-ts-table--current)))
+         (cur (car (nth 2 djot-ts-table--current)))
          (win (djot-ts-table--window))
          (s (djot-ts-table--space-width win))
          (old (mapcar (lambda (i) (plist-get i :cache))
                       (djot-ts-table--info tbeg tend)))
          (new (make-hash-table :test 'djot-ts-table--equal))
-         rows ncols pipe (natural 0) cap cut pipes)
+         rows ncols pipe (natural 0) cap wrapped pipes)
     ;; Measure without our overlays.
     (djot-ts-table--remove tbeg tend)
     (setq rows (djot-ts-table--rows table win s old new))
@@ -360,73 +457,70 @@ cut cells in a `djot-ts-table-info' overlay over TABLE."
                   ((> natural avail)))
         (setq cap (djot-ts-table--cap rows ncols avail s pipe))))
     (when cap
-      (let ((ew (string-pixel-width djot-ts-table-ellipsis (current-buffer))))
-        (dolist (r rows)
-          (unless (plist-get r :sep)
+      (dolist (r rows)
+        (unless (plist-get r :sep)
+          (let ((rbeg (plist-get r :beg)))
             (dolist (c (plist-get r :cells))
               (when (> (plist-get c :need) cap)
-                (let* ((m (plist-get c :m))
-                       (rbeg (plist-get r :beg))
-                       (beg (+ rbeg (plist-get m :beg)))
-                       (res (djot-ts-table--cut m rbeg (- cap (* 2 s)) win ew))
-                       (need (+ (plist-get c :need) (- (cdr res) (plist-get m :w)))))
-                  (push beg cut)
-                  (if (and pt (<= beg pt (+ rbeg (plist-get m :end))))
+                (let* ((lines (djot-ts-table--wrap (plist-get c :m) rbeg
+                                                   (- cap (* 2 s)) win))
+                       (need (+ (seq-max (mapcar (lambda (l) (nth 2 l)) lines))
+                                (* 2 s))))
+                  (unless (eql (car wrapped) rbeg)
+                    (push rbeg wrapped))
+                  (if (eql rbeg cur)
                       (plist-put c :expanded need)
                     (plist-put c :need need)
-                    (plist-put c :cut (+ rbeg (car res)))))))))))
+                    (plist-put c :lines lines)
+                    (plist-put r :wrapped t)))))))))
     ;; Column J ends at pixel (aref pipes J), where the next pipe starts.
     (setq pipes (djot-ts-table--pipes rows ncols))
     (dolist (r rows)
-      ;; SHIFT is how far an expanded cell pushed the rest of the row.
-      (let* ((rbeg (plist-get r :beg)) (x (plist-get r :x0)) (j 0) (shift 0)
-             (sep (plist-get r :sep))
-             (last (1- (length (plist-get r :cells)))))
-        (djot-ts-table--glyph rbeg (if sep "├" "│"))
-        (dolist (c (plist-get r :cells))
-          (let* ((m (plist-get c :m))
-                 (need (plist-get c :need))
-                 (end (+ rbeg (plist-get m :end)))
-                 (pipe (+ (aref pipes j) shift))
-                 (align (nth j (plist-get r :aligns))))
-            (when (> (+ x need) pipe)
-              (setq shift (+ shift (- (+ x need) pipe))
-                    pipe (+ x need)))
-            (if sep
-                (let* ((dbeg (+ rbeg (plist-get m :dbeg)))
-                       (dend (+ rbeg (plist-get m :dend)))
-                       (n (max 1 (floor (- pipe x (plist-get m :fixed))
-                                        (plist-get m :dashw))))
-                       (line (propertize (make-string n ?─) 'face 'djot-ts-table-border)))
-                  (if (< dbeg dend)
-                      (overlay-put (djot-ts-table--overlay dbeg dend 'display line)
-                                   'evaporate t)
-                    (djot-ts-table--overlay dbeg dbeg 'before-string line)))
-              (let* ((cbeg (+ rbeg (plist-get m :cbeg)))
-                     (cend (+ rbeg (plist-get m :cend)))
-                     (free (- pipe x need))
-                     (cx (+ x s (pcase align
-                                  ('right free)
-                                  ('center (/ free 2.0))
-                                  (_ 0)))))
-                (djot-ts-table--space (+ rbeg (plist-get m :beg)) cbeg cx)
-                (when-let* ((from (plist-get c :cut)))
-                  (let ((ov (djot-ts-table--overlay from cend 'display
-                                                    djot-ts-table-ellipsis)))
-                    (overlay-put ov 'evaporate t)
-                    (overlay-put ov 'help-echo
-                                 (buffer-substring-no-properties cbeg cend))))))
-            (djot-ts-table--space (if sep
-                                      end
-                                    (+ rbeg (plist-get m :cend)))
-                                  end pipe)
-            (djot-ts-table--glyph end (cond ((not sep) "│")
-                                            ((= j last) "┤")
-                                            (t "┼")))
-            (setq x (+ pipe (plist-get r :pipe))
-                  j (1+ j))))))
+      (if (plist-get r :wrapped)
+          (djot-ts-table--wrapped-row r pipes s)
+        ;; SHIFT is how far an expanded cell pushed the rest of the row.
+        (let* ((rbeg (plist-get r :beg)) (x (plist-get r :x0)) (j 0) (shift 0)
+               (sep (plist-get r :sep))
+               (last (1- (length (plist-get r :cells)))))
+          (djot-ts-table--glyph rbeg (if sep "├" "│"))
+          (dolist (c (plist-get r :cells))
+            (let* ((m (plist-get c :m))
+                   (need (plist-get c :need))
+                   (end (+ rbeg (plist-get m :end)))
+                   (pipe (+ (aref pipes j) shift))
+                   (align (nth j (plist-get r :aligns))))
+              (when (> (+ x need) pipe)
+                (setq shift (+ shift (- (+ x need) pipe))
+                      pipe (+ x need)))
+              (if sep
+                  (let* ((dbeg (+ rbeg (plist-get m :dbeg)))
+                         (dend (+ rbeg (plist-get m :dend)))
+                         (n (max 1 (floor (- pipe x (plist-get m :fixed))
+                                          (plist-get m :dashw))))
+                         (line (propertize (make-string n ?─) 'face 'djot-ts-table-border)))
+                    (if (< dbeg dend)
+                        (overlay-put (djot-ts-table--overlay dbeg dend 'display line)
+                                     'evaporate t)
+                      (djot-ts-table--overlay dbeg dbeg 'before-string line)))
+                (let* ((cbeg (+ rbeg (plist-get m :cbeg)))
+                       (free (- pipe x need))
+                       (cx (+ x s (pcase align
+                                    ('right free)
+                                    ('center (/ free 2.0))
+                                    (_ 0)))))
+                  (djot-ts-table--space (+ rbeg (plist-get m :beg)) cbeg cx)))
+              (djot-ts-table--space (if sep
+                                        end
+                                      (+ rbeg (plist-get m :cend)))
+                                    end pipe)
+              (djot-ts-table--glyph end (cond ((not sep) "│")
+                                              ((= j last) "┤")
+                                              (t "┼")))
+              (setq x (+ pipe (plist-get r :pipe))
+                    j (1+ j)))))))
     (djot-ts-table--overlay tbeg tend 'djot-ts-table-info
-                            (list :cache new :cap cap :natural natural :cut cut))))
+                            (list :cache new :cap cap :natural natural
+                                  :wrapped wrapped))))
 
 (defun djot-ts-table--align-now (table)
   "Fontify TABLE whole, then align it."
@@ -467,36 +561,39 @@ Also delete the table overlays left there by removed tables."
             (djot-ts-table--tables (max (point-min) (1- pos))
                                    (min (point-max) (1+ pos)))))
 
-(defun djot-ts-table--cell-at (table pos)
-  "Return the bounds (BEG . END) of the content cell of TABLE at POS, or nil."
-  (when-let* ((row (treesit-node-first-child-for-pos table pos t))
-              ((member (treesit-node-type row) '("table_header" "table_row"))))
-    (seq-some (lambda (c)
-                (and (<= (treesit-node-start c) pos (treesit-node-end c))
-                     (cons (treesit-node-start c) (treesit-node-end c))))
-              (treesit-node-children row t))))
+(defun djot-ts-table--row-at (table pos)
+  "Return the bounds (BEG . EOL) of the content row of TABLE at POS, or nil.
+EOL is the end of the row's line, which contains POS."
+  (seq-some (lambda (row)
+              (let ((beg (treesit-node-start row)))
+                (save-excursion
+                  (goto-char beg)
+                  (and (member (treesit-node-type row) '("table_header" "table_row"))
+                       (<= (pos-bol) pos (pos-eol))
+                       (cons beg (pos-eol))))))
+            (treesit-node-children table t)))
 
-(defun djot-ts-table--cut-p (tbeg cbeg)
-  "Non-nil if the table aligned at TBEG has cut the cell at CBEG."
+(defun djot-ts-table--wrapped-p (tbeg rbeg)
+  "Non-nil if the row at RBEG of the table aligned at TBEG overflows."
   (and (< tbeg (point-max))
        (seq-some (lambda (o)
-                   (memql cbeg (plist-get (overlay-get o 'djot-ts-table-info) :cut)))
+                   (memql rbeg (plist-get (overlay-get o 'djot-ts-table-info) :wrapped)))
                  (overlays-at tbeg))))
 
 (defun djot-ts-table--post-command ()
-  "Realign tables when point enters or leaves a cut cell.
-The cell at point is shown uncut."
+  "Realign tables when point enters or leaves an overflowing row.
+The row at point is shown unwrapped."
   (with-demoted-errors "djot-ts-table: %S"
     (let* ((tb (djot-ts-table--at (point)))
-           (cell (and tb (djot-ts-table--cell-at tb (point))))
-           (new (and cell (list (treesit-node-start tb) (treesit-node-end tb) cell)))
+           (row (and tb (djot-ts-table--row-at tb (point))))
+           (new (and row (list (treesit-node-start tb) (treesit-node-end tb) row)))
            (old djot-ts-table--current)
            todo)
       (unless (equal new old)
         (setq djot-ts-table--current new)
         (dolist (cur (list old new))
           (when (and cur
-                     (djot-ts-table--cut-p (car cur) (car (nth 2 cur)))
+                     (djot-ts-table--wrapped-p (car cur) (car (nth 2 cur)))
                      (not (member (take 2 cur) todo)))
             (push (take 2 cur) todo)))
         (dolist (b todo)
