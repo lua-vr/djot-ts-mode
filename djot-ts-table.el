@@ -10,7 +10,9 @@
 ;; `djot-ts-table-mode' aligns the columns of Djot pipe tables by the
 ;; pixel width of their cells, honoring the column alignments of the
 ;; separator lines.  Only the display changes: padding is shown as
-;; stretches, separator lines are extended with dashes.
+;; stretches, pipes as box-drawing characters and the dashes of
+;; separator lines as a box-drawing line.  Columns are widened to a
+;; whole number of line characters, so that the lines join up.
 ;;
 ;; Tables are aligned from `jit-lock-functions', after font-lock, so
 ;; that faces and invisible text (e.g. of `djot-ts-appear-mode') are
@@ -51,8 +53,16 @@ Fontifying them runs `djot-ts-table--jit', which skips them.")
 (defconst djot-ts-table-ellipsis "…"
   "String shown in place of the cut end of a shrunk cell.")
 
+(defface djot-ts-table-border '((t :inherit (shadow fixed-pitch) :weight normal))
+  "Face of the box-drawing characters shown for pipes and dashes.
+It is merged with the face of the text it replaces, e.g. `bold' in
+headers; attributes it sets override that face.
+Its font should have box-drawing characters as tall as the lines, for
+the vertical lines to join up."
+  :group 'djot-ts)
+
 (defconst djot-ts-table--width-props
-  '(display invisible before-string after-string)
+  '(display invisible before-string after-string line-prefix)
   "Overlay properties that can change the width of a row.")
 
 (define-hash-table-test 'djot-ts-table--equal
@@ -66,11 +76,26 @@ measured, but not overlays and line prefixes."
         (win (car (window-text-pixel-size win from to t)))
         (t (string-pixel-width (buffer-substring from to) (current-buffer)))))
 
+(defun djot-ts-table--window ()
+  "Return the window to align the current buffer's tables for, or nil.
+This is the selected window if it shows the buffer, else a window on
+a graphical frame showing it.  Text terminal windows are ignored."
+  (let ((buf (current-buffer)))
+    (if (and (eq (window-buffer) buf) (display-graphic-p))
+        (selected-window)
+      (seq-find (lambda (w) (display-graphic-p (window-frame w)))
+                (get-buffer-window-list buf nil t)))))
+
 (defun djot-ts-table--space-width (win)
   "Return the pixel width of the padding around cell contents in WIN."
   (if win
       (window-font-width win)
     (string-pixel-width " " (current-buffer))))
+
+(defun djot-ts-table--glyph-width (str)
+  "Return the pixel width of STR shown in `djot-ts-table-border'."
+  (string-pixel-width (propertize str 'face 'djot-ts-table-border)
+                      (current-buffer)))
 
 (defun djot-ts-table--avail (win s)
   "Return the pixel width available to tables in WIN.
@@ -91,42 +116,52 @@ This is `left', `right', `center' or nil for the default."
   "Measure ROW, a separator row if SEP, in WIN.
 Return a plist (:x0 :pipe :cells), or nil for a malformed row.
 Positions are relative to the start of ROW.  :x0 is the pixel
-position after the opening pipe, :pipe the width of a pipe.  Each
-cell is a plist with the positions :beg and :end.  Content cells also
-have the positions :cbeg, :cend and the content width :w; separator
-cells have :natural (their width), :align, :dash (position of a `-')
-and :dashw."
+position after the opening pipe, :pipe the width of a pipe, both with
+pipes shown as box-drawing characters.  Each cell is a plist with the
+positions :beg and :end.  Content cells also have the positions
+:cbeg, :cend and the content width :w.  Separator cells have :align,
+the bounds :dbeg and :dend of their dashes, the width :fixed of their
+colons, the width :dashw of a line character and :natural, their
+width with their dashes shown as line characters."
   (let ((rbeg (treesit-node-start row))
         (cells (treesit-node-children row t)))
     (when (and cells (eq (char-after rbeg) ?|))
-      (list
-       :x0 (djot-ts-table--width (save-excursion (goto-char rbeg) (pos-bol))
-                                 (1+ rbeg) win)
-       :pipe (let ((e (treesit-node-end (car cells))))
-               (djot-ts-table--width e (1+ e) win))
-       :cells
-       (mapcar
-        (lambda (c)
-          (let ((beg (treesit-node-start c))
-                (end (treesit-node-end c)))
-            (if sep
-                (let ((dash (save-excursion
-                              (goto-char beg)
-                              (skip-chars-forward ":" end)
-                              (point))))
+      (let ((pipe (djot-ts-table--glyph-width (if sep "┼" "│")))
+            (bol (save-excursion (goto-char rbeg) (pos-bol))))
+        (list
+         ;; In a window, measure even if BOL = RBEG, to count the
+         ;; line prefix.
+         :x0 (+ (if win
+                    (car (window-text-pixel-size win bol rbeg t))
+                  (djot-ts-table--width bol rbeg nil))
+                pipe)
+         :pipe pipe
+         :cells
+         (mapcar
+          (lambda (c)
+            (let ((beg (treesit-node-start c))
+                  (end (treesit-node-end c)))
+              (if sep
+                  (let* ((dbeg (save-excursion
+                                 (goto-char beg) (skip-chars-forward ":" end) (point)))
+                         (dend (save-excursion
+                                 (goto-char end) (skip-chars-backward ":" dbeg) (point)))
+                         (fixed (+ (djot-ts-table--width beg dbeg win)
+                                   (djot-ts-table--width dend end win)))
+                         (dashw (max 1 (djot-ts-table--glyph-width "─"))))
+                    (list :beg (- beg rbeg) :end (- end rbeg)
+                          :dbeg (- dbeg rbeg) :dend (- dend rbeg)
+                          :fixed fixed :dashw dashw
+                          :natural (+ fixed (* (max 1 (- dend dbeg)) dashw))
+                          :align (djot-ts-table--alignment c)))
+                (let* ((cbeg (save-excursion
+                               (goto-char beg) (skip-chars-forward " \t" end) (point)))
+                       (cend (save-excursion
+                               (goto-char end) (skip-chars-backward " \t" cbeg) (point))))
                   (list :beg (- beg rbeg) :end (- end rbeg)
-                        :natural (djot-ts-table--width beg end win)
-                        :align (djot-ts-table--alignment c)
-                        :dash (- dash rbeg)
-                        :dashw (max 1 (djot-ts-table--width dash (1+ dash) win))))
-              (let* ((cbeg (save-excursion
-                             (goto-char beg) (skip-chars-forward " \t" end) (point)))
-                     (cend (save-excursion
-                             (goto-char end) (skip-chars-backward " \t" cbeg) (point))))
-                (list :beg (- beg rbeg) :end (- end rbeg)
-                      :cbeg (- cbeg rbeg) :cend (- cend rbeg)
-                      :w (djot-ts-table--width cbeg cend win))))))
-        cells)))))
+                        :cbeg (- cbeg rbeg) :cend (- cend rbeg)
+                        :w (djot-ts-table--width cbeg cend win))))))
+          cells))))))
 
 (defun djot-ts-table--row-key (row sep)
   "Return the cache key of ROW, a separator row if SEP.
@@ -199,6 +234,14 @@ If BEG = END, insert that space at BEG instead."
       (djot-ts-table--overlay beg beg 'before-string
                               (propertize " " 'display spec)))))
 
+(defun djot-ts-table--glyph (pos str)
+  "Show the pipe at POS as STR."
+  (when (eq (char-after pos) ?|)
+    (overlay-put (djot-ts-table--overlay
+                  pos (1+ pos) 'display
+                  (propertize str 'face 'djot-ts-table-border))
+                 'evaporate t)))
+
 (defun djot-ts-table--remove (beg end &optional keep)
   "Delete the table overlays between BEG and END.
 Keep those inside one of the ranges (FROM . TO) in KEEP."
@@ -218,7 +261,8 @@ See the `djot-ts-table-info' overlay made by `djot-ts-table--align'."
 (defun djot-ts-table--pipes (rows ncols &optional cap)
   "Return a vector of the pixel positions of the pipes after each column.
 With CAP, content cells take at most CAP pixels.  A cell with
-:expanded counts as that many pixels wide."
+:expanded counts as that many pixels wide.  Separator cells are
+widened to a whole number of line characters."
   ;; Called repeatedly by `djot-ts-table--cap', so it avoids consing.
   (let ((pipes (make-vector ncols 0))
         ;; Where column J starts in each row.
@@ -231,6 +275,15 @@ With CAP, content cells take at most CAP pixels.  A cell with
               (when (and cap (not (plist-get r :sep)))
                 (setq need (min need cap)))
               (setq p (max p (+ (aref starts i) need)))))
+          (setq i (1+ i)))
+        (setq i 0)
+        (dolist (r rows)
+          (when-let* (((plist-get r :sep))
+                      (c (nth j (plist-get r :cells))))
+            (let* ((m (plist-get c :m))
+                   (base (+ (aref starts i) (plist-get m :fixed)))
+                   (q (plist-get m :dashw)))
+              (setq p (+ base (* q (ceiling (- p base) q))))))
           (setq i (1+ i)))
         (aset pipes j p)
         (setq i 0)
@@ -288,7 +341,7 @@ cut cells in a `djot-ts-table-info' overlay over TABLE."
          ;; Not point: under jit-lock, point is wherever earlier
          ;; fontification functions left it.
          (pt (car (nth 2 djot-ts-table--current)))
-         (win (get-buffer-window (current-buffer) t))
+         (win (djot-ts-table--window))
          (s (djot-ts-table--space-width win))
          (old (mapcar (lambda (i) (plist-get i :cache))
                       (djot-ts-table--info tbeg tend)))
@@ -326,7 +379,10 @@ cut cells in a `djot-ts-table-info' overlay over TABLE."
     (setq pipes (djot-ts-table--pipes rows ncols))
     (dolist (r rows)
       ;; SHIFT is how far an expanded cell pushed the rest of the row.
-      (let ((rbeg (plist-get r :beg)) (x (plist-get r :x0)) (j 0) (shift 0))
+      (let* ((rbeg (plist-get r :beg)) (x (plist-get r :x0)) (j 0) (shift 0)
+             (sep (plist-get r :sep))
+             (last (1- (length (plist-get r :cells)))))
+        (djot-ts-table--glyph rbeg (if sep "├" "│"))
         (dolist (c (plist-get r :cells))
           (let* ((m (plist-get c :m))
                  (need (plist-get c :need))
@@ -336,14 +392,16 @@ cut cells in a `djot-ts-table-info' overlay over TABLE."
             (when (> (+ x need) pipe)
               (setq shift (+ shift (- (+ x need) pipe))
                     pipe (+ x need)))
-            (if (plist-get r :sep)
-                (let ((n (floor (- pipe x (plist-get m :natural)) (plist-get m :dashw))))
-                  (when (> n 0)
-                    (djot-ts-table--overlay
-                     (1- end) (1- end) 'before-string
-                     (propertize (make-string n ?-)
-                                 'face (get-text-property (+ rbeg (plist-get m :dash))
-                                                          'face)))))
+            (if sep
+                (let* ((dbeg (+ rbeg (plist-get m :dbeg)))
+                       (dend (+ rbeg (plist-get m :dend)))
+                       (n (max 1 (floor (- pipe x (plist-get m :fixed))
+                                        (plist-get m :dashw))))
+                       (line (propertize (make-string n ?─) 'face 'djot-ts-table-border)))
+                  (if (< dbeg dend)
+                      (overlay-put (djot-ts-table--overlay dbeg dend 'display line)
+                                   'evaporate t)
+                    (djot-ts-table--overlay dbeg dbeg 'before-string line)))
               (let* ((cbeg (+ rbeg (plist-get m :cbeg)))
                      (cend (+ rbeg (plist-get m :cend)))
                      (free (- pipe x need))
@@ -358,10 +416,13 @@ cut cells in a `djot-ts-table-info' overlay over TABLE."
                     (overlay-put ov 'evaporate t)
                     (overlay-put ov 'help-echo
                                  (buffer-substring-no-properties cbeg cend))))))
-            (djot-ts-table--space (if (plist-get r :sep)
+            (djot-ts-table--space (if sep
                                       end
                                     (+ rbeg (plist-get m :cend)))
                                   end pipe)
+            (djot-ts-table--glyph end (cond ((not sep) "│")
+                                            ((= j last) "┤")
+                                            (t "┼")))
             (setq x (+ pipe (plist-get r :pipe))
                   j (1+ j))))))
     (djot-ts-table--overlay tbeg tend 'djot-ts-table-info
@@ -446,7 +507,7 @@ The cell at point is shown uncut."
   "Realign the tables of WIN's buffer that its new width affects.
 These are the shrunk tables and those that no longer fit."
   (with-current-buffer (window-buffer win)
-    (when-let* ((w (get-buffer-window (current-buffer) t))
+    (when-let* ((w (djot-ts-table--window))
                 (width (window-body-width w t))
                 ((not (eql width djot-ts-table--body-width))))
       (setq djot-ts-table--body-width width)
