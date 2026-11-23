@@ -266,10 +266,13 @@ Backends call this when an image arrives, see
 That fragment stays dirty."
   (let* ((beg (car djot-ts-math--dirty))
          (end (cdr djot-ts-math--dirty))
-         (frags (djot-ts-math--fragments beg end))
+         ;; The region may predate a narrowing.
+         (vbeg (min (max beg (point-min)) (point-max)))
+         (vend (max (min end (point-max)) vbeg))
+         (frags (djot-ts-math--fragments vbeg vend))
          (here (seq-find (lambda (f) (and (<= (nth 0 f) pt) (< pt (nth 1 f))))
                          frags)))
-    (dolist (ov (djot-ts-math--overlays beg end))
+    (dolist (ov (djot-ts-math--overlays vbeg vend))
       (unless (seq-find (lambda (f) (and (= (nth 0 f) (overlay-start ov))
                                          (= (nth 1 f) (overlay-end ov))))
                         frags)
