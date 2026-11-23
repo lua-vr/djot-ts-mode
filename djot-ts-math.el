@@ -163,7 +163,7 @@ the overlay when they do."
 (defun djot-ts-math--center-space (img)
   "Return a space that centers IMG following it."
   (propertize " " 'face 'default
-              'display `(space :align-to (- center (0.55 . ,img)))))
+              'display `(space :align-to (- center (0.5 . ,img)))))
 
 (defun djot-ts-math--layout-strings (ov)
   "Return (BEFORE . AFTER) strings laying out the preview OV, or nil.

@@ -31,11 +31,14 @@
               (org-latex-preview--get-preamble)))))
 
 (defun djot-ts-math-org--place (entries)
-  "Preview ENTRIES with `org-latex-preview-place'."
+  "Preview ENTRIES with `org-latex-preview-place'.
+Display math is rendered as inline math in display style, so that its
+image is as wide as the math, not as the page, and can be centered."
   (org-latex-preview-place
    org-latex-preview-process-default
    (mapcar (pcase-lambda (`(,beg ,end ,tex ,display))
-             (list beg end (format (if display "\\[%s\\]" "\\(%s\\)") tex)))
+             (list beg end (format (if display "\\(\\displaystyle %s\\)" "\\(%s\\)")
+                                   tex)))
            entries)
    nil (djot-ts-math-org--preamble)))
 
