@@ -2,6 +2,8 @@
 
 Emacs major mode for [Djot](https://djot.net), using tree-sitter.
 
+![Demo](assets/demo.gif)
+
 ## Features
 
 - `djot-ts-mode`: highlighting, imenu, and folding of sections and
